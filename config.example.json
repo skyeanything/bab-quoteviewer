@@ -1,0 +1,11 @@
+{
+  "bridgeUrl": "wss://quotes.example.com",
+  "sourceId": "example-source",
+  "group": "demo\\group",
+  "httpPort": 8877,
+  "tokenCommand": [
+    "dotnet",
+    "examples/TokenIssuer/bin/Release/net10.0/TokenIssuer.dll",
+    "issuer.local.json"
+  ]
+}

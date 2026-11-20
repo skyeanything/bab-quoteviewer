@@ -1,0 +1,17 @@
+**/bin/
+**/obj/
+**/__pycache__/
+**/config.json
+*.local.json
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.pfx
+*.p12
+*.log
+*.trx
+secrets/
+TestResults/
+.DS_Store

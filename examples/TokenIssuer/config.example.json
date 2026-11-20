@@ -1,0 +1,10 @@
+{
+  "issuer": "example-backend",
+  "audience": "example-bridge",
+  "keyId": "example-key",
+  "subject": "example-quote-client",
+  "sourceId": "example-source",
+  "group": "demo\\group",
+  "privateKeyFile": "secrets/signing-key.pem",
+  "lifetimeSeconds": 120
+}
