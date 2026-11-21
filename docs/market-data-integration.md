@@ -4,6 +4,8 @@ This guide describes how another App's **backend** authenticates to MT5 Bridge a
 
 Every address, identity, group, key ID and price below is an example. Obtain actual deployment values through your private onboarding channel. This repository contains no production endpoint or signing key.
 
+Start with [who issues the JWT](#who-issues-the-jwt), [key registration](#register-a-signing-key-once), and [the complete Python signing example](#generate-a-jwt-in-python). The later sections specify subscription messages, quote fields, renewal, errors and reconnect behavior.
+
 ## 1. Components and onboarding
 
 ```text
@@ -30,7 +32,171 @@ A group is the account/pricing group, not an asset category such as metals or eq
 
 Bridge validates credentials; this protocol does **not** define a public login or token-issuance endpoint. A trusted signing backend signs JWTs, or an existing authenticated token service supplies them to the consumer. Never expose a signing key or a general-purpose token issuer to the App browser. Keep signing grants limited to the approved source/group.
 
+### Who issues the JWT
+
+JWT issuance and WebSocket authentication are separate operations:
+
+| Role | Responsibility | Holds the signing private key? |
+| --- | --- | --- |
+| Trusted issuer | Authorize the caller and construct its allowed grant; sign a short-lived JWT | Yes |
+| App backend / consumer | Obtain a JWT, connect to Bridge, subscribe and renew before expiry | Only if the operator also trusts this backend as an issuer |
+| Bridge | Verify the signature, claims and requested scope; enforce expiry | No; it holds verification public keys |
+| App browser / mobile frontend | Receive prices from the App backend | No |
+
+QuoteViewer's `TokenIssuer` combines the trusted-issuer and consumer roles for an operator-controlled backend. It signs on the local machine using its configured private key. There is no MT5 terminal login, SSH command or Bridge token request in this path.
+
+For an external consumer that is **not** a trusted issuer, keep the private key in your own issuer and deliver only scoped, short-lived JWTs through an authenticated token service. The token-service URL, client authentication and response contract must be supplied separately; they are not endpoints implemented by this Bridge or this example. The `issue_token` callback is where an existing service can be connected.
+
+**Trust boundary:** the current Bridge key ring maps `kid` to a public key under the configured issuer/audience. It does not associate a key with an allowlist of callers, sources, groups or grant types. Registering a public key therefore trusts its holder to issue authorization claims, not merely to read the sample group. A token containing only `referenceReads` grants only those reads, but that token does not constrain what other tokens the same private key can sign. Do not treat a signing private key as a restricted partner API key.
+
+### Connection contract at a glance
+
+| Item | Contract |
+| --- | --- |
+| Transport | WebSocket over `ws://` or `wss://`; direct backend connection |
+| Upgrade request | `GET /v1/sources/{sourceId}/quotes/stream?group=<encoded-group>` |
+| `sourceId` | Required path string; URL-encode the segment; exact configured source |
+| `group` | Required query string for all-group mode; URL-encode the exact MT5 account group |
+| `Authorization` | Required request header: `Bearer <signed-jwt>` |
+| Successful upgrade | HTTP `101 Switching Protocols` |
+| Initial subscription | UTF-8 JSON text `{"all":true}`; omit the `symbol` query parameter |
+| Server messages | JSON text: `quote`, `context`, or `authorization` |
+| Renewal | Send `{"type":"authorization","token":"<new-jwt>"}` on the same socket |
+| Expiry | Absolute JWT expiry; successful renewal installs the new expiry |
+
 ## 2. JWT authentication rules
+
+### Register a signing key once
+
+The operator must approve the issuer role before registering a key. Generate the key pair once, not for each token or reconnect. The following POSIX-shell commands require OpenSSL and run in a new, private issuer directory. Do not overwrite an existing live signing key:
+
+```sh
+umask 077
+mkdir secrets
+openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 \
+  -out secrets/signing-key.pem
+openssl pkey -in secrets/signing-key.pem -pubout \
+  -out secrets/signing-public.pem
+```
+
+The issuer retains `signing-key.pem`. Give the operator `signing-public.pem` and the agreed `kid`, such as `example-key`, through the onboarding channel. The public key verifies signatures; it cannot generate a valid JWT. The `kid` is a lookup identifier, not a password or secret.
+
+The operator registers the public key in Bridge's existing `Authorization:Jwt` configuration. This fragment shows field names and example values; the PEM placeholder must be replaced with the complete public-key file contents:
+
+```json
+{
+  "Authorization": {
+    "Jwt": {
+      "Enabled": true,
+      "Issuer": "example-backend",
+      "Audience": "example-bridge",
+      "MaximumTokenLifetime": "00:02:00",
+      "ClockSkew": "00:00:15",
+      "PublicKeys": [
+        {
+          "KeyId": "example-key",
+          "PublicKeyPem": "<complete PEM public key with JSON-escaped newlines>"
+        }
+      ]
+    }
+  }
+}
+```
+
+Append an entry to the existing key ring instead of replacing keys used by other callers. The current ring accepts up to 16 unique key IDs. `PublicKeyPem` is PEM **content**, not a filename; JSON uses `\n` to represent line breaks. Private-key PEM content is rejected in this setting. For environment-variable configuration, the same key entry uses `Authorization__Jwt__PublicKeys__N__KeyId` and `Authorization__Jwt__PublicKeys__N__PublicKeyPem`, where `N` is the next array index.
+
+Apply the change through the operator's deployment process and restart the Bridge host to rebuild its current key ring. Register a replacement public key before using its `kid`; keep the old key during the agreed overlap. Consumers must handle any service restart as a genuine disconnect.
+
+The consumer's private configuration then uses the same issuer, audience and key ID, the agreed source/group and a stable caller identity. See [config.example.json](../config.example.json). A key generated locally is not accepted until Bridge trusts its matching public key.
+
+### Generate a JWT in Python
+
+Install this repository's dependencies in the Python environment:
+
+```sh
+python -m pip install -r requirements.txt
+```
+
+The complete signing function below uses the same claims as QuoteViewer. Run it inside the trusted issuer. The private key is loaded once; each call issues a fresh token with a new `jti` and current UTC timestamps. `source_id`, `group` and `subject` must come from the issuer's approved caller policy, not unchecked client input.
+
+```python
+from pathlib import Path
+import time
+import uuid
+
+from cryptography.hazmat.primitives import serialization
+import jwt
+
+private_key = serialization.load_pem_private_key(
+    Path("secrets/signing-key.pem").read_bytes(), password=None
+)
+
+def issue_quote_token(*, source_id: str, group: str, subject: str):
+    now = int(time.time())
+    expires_at = now + 120
+    payload = {
+        "iss": "example-backend",
+        "aud": "example-bridge",
+        "sub": subject,
+        "jti": uuid.uuid4().hex,
+        "iat": now,
+        "nbf": now,
+        "exp": expires_at,
+        "mt5bridge_grant": {
+            "version": "1",
+            "referenceReads": [
+                {"sourceId": source_id, "group": group, "symbol": None}
+            ],
+        },
+    }
+    token = jwt.encode(
+        payload,
+        private_key,
+        algorithm="RS256",
+        headers={"typ": "JWT", "kid": "example-key"},
+    )
+    return token, expires_at
+
+token, expires_at = issue_quote_token(
+    source_id="example-source",
+    group=r"demo\group",
+    subject="example-quote-client",
+)
+```
+
+`token` is the compact signed string to send to Bridge; `expires_at` is Unix UTC seconds for the client's renewal schedule. Do not print the token in shared logs. This example uses an unencrypted PEM protected by issuer filesystem permissions; an encrypted PEM requires the corresponding secret-management/password integration. Signing creates a credential, not an encrypted payload: JWT header and payload are readable by anyone holding it. Signing also does not encrypt `ws://` traffic.
+
+For every connection and renewal, call the function again with the same approved `sub` and scope. Do not cache one token indefinitely, change `exp` on an already signed string, or generate a new RSA key at each renewal. A valid signature is required after any payload change.
+
+The same function can supply the complete client's existing async token-provider interface. Run this adapter from the repository root after defining the function above; the private `config.json` must specify the same source/group and issuer values:
+
+```python
+import asyncio
+import json
+from aiohttp import web
+from quoteviewer import QuoteFeed, Token, create_app
+
+config = json.loads(Path("config.json").read_text())
+
+async def issue_token():
+    value, expiry = await asyncio.to_thread(
+        issue_quote_token,
+        source_id=config["sourceId"],
+        group=config["group"],
+        subject=config["auth"]["subject"],
+    )
+    return Token(value, expiry)
+
+feed = QuoteFeed(config, issue_token)
+web.run_app(
+    create_app(feed), host="localhost", port=config.get("httpPort", 8877),
+    access_log=None,
+)
+```
+
+`QuoteFeed` sends the group subscription, receives prices, renews on the same socket and preserves stale cache on a genuine disconnect. For ordinary use, `python start.py` already performs this setup with the configured `TokenIssuer`; there is no need to maintain a second signing implementation.
+
+References for the library calls: [OpenSSL RSA key generation](https://docs.openssl.org/3.0/man1/openssl-genpkey/) and [PyJWT RS256 signing](https://pyjwt.readthedocs.io/en/stable/usage.html#encoding-decoding-tokens-with-rs256-rsa). Bridge-specific claims and restrictions are defined below.
 
 ### Signing and verification
 
@@ -48,28 +214,7 @@ Header:
 | `typ` | Exactly `JWT` |
 | `kid` | Nonblank string, at most 256 characters; must match a configured verification key |
 
-Payload construction, with current Unix UTC seconds:
-
-```javascript
-const now = Math.floor(Date.now() / 1000);
-const payload = {
-  iss: "example-backend",
-  aud: "example-bridge",
-  sub: "example-quote-client",
-  jti: crypto.randomUUID(),
-  iat: now,
-  nbf: now,
-  exp: now + 120,
-  mt5bridge_grant: {
-    version: "1",
-    referenceReads: [
-      { sourceId: "example-source", group: "demo\\group", symbol: null }
-    ]
-  }
-};
-```
-
-This block shows claim construction, not JWT signing. The `TokenIssuer` in [quoteviewer.py](../quoteviewer.py) signs these claims locally in the authorized Python backend and returns a fresh token to QuoteViewer. `config.example.json` documents the issuer settings; the signing key must already be trusted by Bridge.
+The [Python signing function](#generate-a-jwt-in-python) constructs the payload and signs it. The `TokenIssuer` in [quoteviewer.py](../quoteviewer.py) uses the same fields with deployment values from the private configuration.
 
 | Claim | Required rule |
 | --- | --- |

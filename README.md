@@ -6,6 +6,10 @@ One WebSocket subscribes to all symbols in one authorized MT5 account group. JWT
 
 Read the [market-data integration guide](docs/market-data-integration.md) for JWT claims, subscription frames, acknowledgments, freshness and error handling.
 
+For a colleague handoff in Chinese, use the [step-by-step integration handbook](docs/partner-onboarding.zh-CN.md), including the prerequisites, responsibilities, key registration, token generation, renewal and quote handling.
+
+For JWT setup, see [who signs the token](docs/market-data-integration.md#who-issues-the-jwt), [how to register the public key](docs/market-data-integration.md#register-a-signing-key-once), and [the complete Python signing example](docs/market-data-integration.md#generate-a-jwt-in-python). Bridge verifies JWTs but does not provide a token-issuance endpoint. A registered signing key grants issuer trust; it is not a partner API key restricted to the sample group.
+
 ## What the operator must supply
 
 - A reachable WebSocket base URL, such as `wss://quotes.example.com`, or `ws://<host>:<port>` for an operator-provided HTTP listener. `<host>` can be an IP address.
