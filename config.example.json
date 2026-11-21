@@ -3,12 +3,10 @@
   "sourceId": "example-source",
   "group": "demo\\group",
   "httpPort": 8877,
+  "tlsCaFile": null,
   "auth": {
-    "issuer": "example-backend",
-    "audience": "example-bridge",
-    "keyId": "example-key",
-    "subject": "example-quote-client",
-    "privateKeyFile": "secrets/signing-key.pem",
-    "lifetimeSeconds": 120
+    "tokenUrl": "https://quotes.example.com/v1/quote-tokens",
+    "clientId": "example-client",
+    "clientSecretFile": "secrets/client-secret.txt"
   }
 }

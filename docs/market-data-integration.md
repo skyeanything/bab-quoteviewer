@@ -1,259 +1,136 @@
 # Market-data integration guide
 
-This guide describes how another App's **backend** authenticates to MT5 Bridge and receives all quotes in an authorized account group over one WebSocket. It covers the protocol with in-connection JWT renewal. Older Bridge builds that reject authorization messages must be upgraded before using this client.
+This guide describes the ordinary third-party flow: use an independent client ID and secret to obtain a short-lived JWT, then receive all quotes in the assigned MT5 account group over one WebSocket. Bridge supplies and signs the JWT; the partner never receives a signing key.
 
-Every address, identity, group, key ID and price below is an example. Obtain actual deployment values through your private onboarding channel. This repository contains no production endpoint or signing key.
-
-Start with [who issues the JWT](#who-issues-the-jwt), [key registration](#register-a-signing-key-once), and [the complete Python signing example](#generate-a-jwt-in-python). The later sections specify subscription messages, quote fields, renewal, errors and reconnect behavior.
+All addresses and identities in this public document are examples. The operator's **private handoff package** contains actual configuration, the independent credential and any required server trust certificate. Start with [the Chinese handoff guide](partner-onboarding.zh-CN.md) when forwarding the package to a colleague.
 
 ## 1. Components and onboarding
 
 ```text
-MT5 → Bridge → one backend WebSocket → App backend cache → App users
-                             ↑
-                short-lived JWTs from a trusted issuer
+App backend -- client ID + secret over HTTPS --> Bridge token endpoint
+App backend <-- scoped, short-lived JWT -------- Bridge token endpoint
+MT5 --> Bridge -- one authenticated WSS stream --> App backend cache --> App users
 ```
 
-The receiving backend owns the direct WS/WSS connection, token renewal and latest-value cache. It can distribute its authorized prices to its own clients. QuoteViewer implements this in Python and adds a local browser table for verification. No SSH access or .NET installation is required. The operator must provide a reachable endpoint; a loopback-only listener is not sufficient for an external consumer.
+The receiving backend owns token acquisition, renewal and the latest-value cache. QuoteViewer implements this in Python and adds a local browser table. Install Python 3.11 or later; no SSH access, .NET SDK, MT5 terminal or Manager SDK is required.
 
-Agree on these values with the Bridge operator before connecting:
+The operator must supply these files through a private channel:
 
-| Value | Meaning |
+| File/value | Purpose |
 | --- | --- |
-| WebSocket base URL | The reachable `ws://` or `wss://` endpoint, including its port; listener and TLS configuration belong to the operator |
-| `sourceId` | An opaque identifier for one configured MT5 source; it is not an account login or symbol |
-| `group` | The exact MT5 account-group name used for group pricing |
-| `iss` and `aud` | The issuer and audience registered in Bridge |
-| `kid` and RSA public key | The trusted signing-key identifier and verification key |
-| `sub` | A stable identity for the calling backend |
-| Lifetime and limits | The deployment's JWT lifetime, clock skew and quote capacity settings |
+| `config.json` | Actual `bridgeUrl`, `auth.tokenUrl`, `sourceId`, `group`, `auth.clientId` and credential/certificate paths |
+| `secrets/client-secret.txt` | Unique, randomly generated client secret; store only on the receiving backend |
+| `certs/bridge-ca.pem` | Public trust certificate for a private-CA deployment; no private key |
+| Client code and dependencies | `quoteviewer.py`, launchers, `requirements.txt`, browser files and guides |
 
-A group is the account/pricing group, not an asset category such as metals or equities. Source IDs, groups and symbols are matched exactly, including case and symbol suffixes.
+`sourceId` identifies the configured MT5 source. `group` is the exact MT5 **account/pricing group**, not an asset category such as metals or equities. Names are case-sensitive and retain backslashes/suffixes. The server binds the client credential to one source and group; editing the local config does not change permission.
 
-Bridge validates credentials; this protocol does **not** define a public login or token-issuance endpoint. A trusted signing backend signs JWTs, or an existing authenticated token service supplies them to the consumer. Never expose a signing key or a general-purpose token issuer to the App browser. Keep signing grants limited to the approved source/group.
+The server supplies `iss` (issuer), `aud` (audience), `kid` (signing-key ID), `sub` (stable client identity), timestamps and the grant. A partner does not need to request these values, generate them or implement JWT signing. Treat the returned token as a bearer credential.
 
-### Who issues the JWT
+## 2. Obtain and refresh a JWT
 
-JWT issuance and WebSocket authentication are separate operations:
+### Request
 
-| Role | Responsibility | Holds the signing private key? |
-| --- | --- | --- |
-| Trusted issuer | Authorize the caller and construct its allowed grant; sign a short-lived JWT | Yes |
-| App backend / consumer | Obtain a JWT, connect to Bridge, subscribe and renew before expiry | Only if the operator also trusts this backend as an issuer |
-| Bridge | Verify the signature, claims and requested scope; enforce expiry | No; it holds verification public keys |
-| App browser / mobile frontend | Receive prices from the App backend | No |
+```http
+POST /v1/quote-tokens HTTP/1.1
+Authorization: Basic <base64(client_id:client_secret)>
+Content-Type: application/x-www-form-urlencoded
 
-QuoteViewer's `TokenIssuer` combines the trusted-issuer and consumer roles for an operator-controlled backend. It signs on the local machine using its configured private key. There is no MT5 terminal login, SSH command or Bridge token request in this path.
-
-For an external consumer that is **not** a trusted issuer, keep the private key in your own issuer and deliver only scoped, short-lived JWTs through an authenticated token service. The token-service URL, client authentication and response contract must be supplied separately; they are not endpoints implemented by this Bridge or this example. The `issue_token` callback is where an existing service can be connected.
-
-**Trust boundary:** the current Bridge key ring maps `kid` to a public key under the configured issuer/audience. It does not associate a key with an allowlist of callers, sources, groups or grant types. Registering a public key therefore trusts its holder to issue authorization claims, not merely to read the sample group. A token containing only `referenceReads` grants only those reads, but that token does not constrain what other tokens the same private key can sign. Do not treat a signing private key as a restricted partner API key.
-
-### Connection contract at a glance
+grant_type=client_credentials
+```
 
 | Item | Contract |
 | --- | --- |
-| Transport | WebSocket over `ws://` or `wss://`; direct backend connection |
-| Upgrade request | `GET /v1/sources/{sourceId}/quotes/stream?group=<encoded-group>` |
-| `sourceId` | Required path string; URL-encode the segment; exact configured source |
-| `group` | Required query string for all-group mode; URL-encode the exact MT5 account group |
-| `Authorization` | Required request header: `Bearer <signed-jwt>` |
-| Successful upgrade | HTTP `101 Switching Protocols` |
-| Initial subscription | UTF-8 JSON text `{"all":true}`; omit the `symbol` query parameter |
-| Server messages | JSON text: `quote`, `context`, or `authorization` |
-| Renewal | Send `{"type":"authorization","token":"<new-jwt>"}` on the same socket |
-| Expiry | Absolute JWT expiry; successful renewal installs the new expiry |
+| URL | Full operator-supplied HTTPS token URL; path `/v1/quote-tokens` |
+| Authentication | HTTP Basic; UTF-8 `client_id:client_secret`, then Base64 |
+| `client_id` | Operator-assigned identifier, at most 64 ASCII letters/digits or `-_.` |
+| `client_secret` | Operator-supplied random secret; never a JWT or signing key |
+| Body | Exactly one field: `grant_type=client_credentials` |
+| `sourceId`, `group`, `scope`, `iss`, `aud`, `sub` | Do not send; additional form fields are rejected |
+| TLS | Required; validate the certificate chain and DNS name or IP SAN |
 
-## 2. JWT authentication rules
+Base64 is not encryption. The Python provider requires HTTPS for credentials and WSS for quotes, follows no token-endpoint redirects, and trusts the supplied CA file while retaining hostname/IP validation. Do not disable certificate verification. IP-and-port access works when the certificate contains that IP in its SAN.
 
-### Register a signing key once
-
-The operator must approve the issuer role before registering a key. Generate the key pair once, not for each token or reconnect. The following POSIX-shell commands require OpenSSL and run in a new, private issuer directory. Do not overwrite an existing live signing key:
-
-```sh
-umask 077
-mkdir secrets
-openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 \
-  -out secrets/signing-key.pem
-openssl pkey -in secrets/signing-key.pem -pubout \
-  -out secrets/signing-public.pem
-```
-
-The issuer retains `signing-key.pem`. Give the operator `signing-public.pem` and the agreed `kid`, such as `example-key`, through the onboarding channel. The public key verifies signatures; it cannot generate a valid JWT. The `kid` is a lookup identifier, not a password or secret.
-
-The operator registers the public key in Bridge's existing `Authorization:Jwt` configuration. This fragment shows field names and example values; the PEM placeholder must be replaced with the complete public-key file contents:
+### Success: HTTP 200
 
 ```json
 {
-  "Authorization": {
-    "Jwt": {
-      "Enabled": true,
-      "Issuer": "example-backend",
-      "Audience": "example-bridge",
-      "MaximumTokenLifetime": "00:02:00",
-      "ClockSkew": "00:00:15",
-      "PublicKeys": [
-        {
-          "KeyId": "example-key",
-          "PublicKeyPem": "<complete PEM public key with JSON-escaped newlines>"
-        }
-      ]
-    }
-  }
+  "access_token": "<signed-compact-jwt>",
+  "token_type": "Bearer",
+  "expires_in": 120,
+  "expires_at": 1790000120
 }
 ```
 
-Append an entry to the existing key ring instead of replacing keys used by other callers. The current ring accepts up to 16 unique key IDs. `PublicKeyPem` is PEM **content**, not a filename; JSON uses `\n` to represent line breaks. Private-key PEM content is rejected in this setting. For environment-variable configuration, the same key entry uses `Authorization__Jwt__PublicKeys__N__KeyId` and `Authorization__Jwt__PublicKeys__N__PublicKeyPem`, where `N` is the next array index.
+The timestamp above is illustrative; use each actual response.
 
-Apply the change through the operator's deployment process and restart the Bridge host to rebuild its current key ring. Register a replacement public key before using its `kid`; keep the old key during the agreed overlap. Consumers must handle any service restart as a genuine disconnect.
+| Field | Type and meaning |
+| --- | --- |
+| `access_token` | String; fresh RS256 JWT |
+| `token_type` | String; `Bearer` |
+| `expires_in` | Integer seconds; default/configured deployment lifetime is 120 seconds |
+| `expires_at` | Integer Unix UTC seconds; absolute expiration, not milliseconds |
 
-The consumer's private configuration then uses the same issuer, audience and key ID, the agreed source/group and a stable caller identity. See [config.example.json](../config.example.json). A key generated locally is not accepted until Bridge trusts its matching public key.
+Responses use `Cache-Control: no-store` and `Pragma: no-cache`. Do not log the secret, Authorization header or JWT. Keep host clocks synchronized.
 
-### Generate a JWT in Python
+There is **no refresh token**. Before expiry, repeat the same credential-authenticated POST to obtain a new JWT. Each issuance has a new `jti` and timestamps, with the same configured caller and group scope. Reusing a JWT after expiry is rejected; editing its payload invalidates its signature.
 
-Install this repository's dependencies in the Python environment:
+### Errors and rate limit
 
-```sh
-python -m pip install -r requirements.txt
-```
+| HTTP status | Body/code | Action |
+| --- | --- | --- |
+| 400 | `{"error":"https_required"}` | Use the supplied HTTPS endpoint |
+| 400 | `{"error":"invalid_request"}` | Check form content type and the single `grant_type` field |
+| 401 | `{"error":"invalid_client"}` | Check the supplied client ID/secret or ask the operator to check enabled status; response has a Basic authentication challenge |
+| 429 | `{"code":"capacity_limit_reached","workClass":null}` | Back off; do not run a tight retry loop |
+| 404 | Endpoint unavailable | Confirm URL and whether issuance is enabled in the deployed version |
+| 5xx / network failure | Service failure | Retry with delay while the current token remains valid; preserve stale quotes if it expires |
 
-The complete signing function below uses the same claims as QuoteViewer. Run it inside the trusted issuer. The private key is loaded once; each call issues a fresh token with a new `jti` and current UTC timestamps. `source_id`, `group` and `subject` must come from the issuer's approved caller policy, not unchecked client input.
+Default token endpoint capacity is **60 requests per minute across the endpoint**, using fixed windows and no queue. This is configurable, not a per-client allowance. There is no `Retry-After` contract. One receiving backend normally requests a token about every 90 seconds with a 120-second token; do not create a token request per symbol or per App user.
 
-```python
-from pathlib import Path
-import time
-import uuid
+### Permission boundary and credential changes
 
-from cryptography.hazmat.primitives import serialization
-import jwt
+The issued grant contains only one `referenceReads` entry for the server-configured source/group, with `symbol: null`. This allows that group's catalog, symbol metadata and quotes. It does not authorize another source/group, source-wide catalog access, account reads, trading, funding or account changes. The token endpoint accepts no client-supplied grant.
 
-private_key = serialization.load_pem_private_key(
-    Path("secrets/signing-key.pem").read_bytes(), password=None
-)
+The operator owns signing keys and the client registry. It stores SHA-256 of the high-entropy secret, compares it in constant time and derives the stable caller as `quote-client:<client_id>`. JWT signing uses the configured issuer/audience and a registered RSA key. Partners do not access these settings.
 
-def issue_quote_token(*, source_id: str, group: str, subject: str):
-    now = int(time.time())
-    expires_at = now + 120
-    payload = {
-        "iss": "example-backend",
-        "aud": "example-bridge",
-        "sub": subject,
-        "jti": uuid.uuid4().hex,
-        "iat": now,
-        "nbf": now,
-        "exp": expires_at,
-        "mt5bridge_grant": {
-            "version": "1",
-            "referenceReads": [
-                {"sourceId": source_id, "group": group, "symbol": None}
-            ],
-        },
-    }
-    token = jwt.encode(
-        payload,
-        private_key,
-        algorithm="RS256",
-        headers={"typ": "JWT", "kid": "example-key"},
-    )
-    return token, expires_at
+For a secret rotation, the operator replaces the registered hash and delivers a replacement secret privately. For disablement, the operator disables the client. These configuration changes require a Bridge restart in this deployment; the client reconnects afterward. Existing signed JWTs are not independently revoked merely by changing the secret: they remain cryptographically valid until their original expiry, at most the configured lifetime. Do not promise instantaneous JWT revocation. The Python provider reads the secret at process startup; restart it after replacing the secret file.
 
-token, expires_at = issue_quote_token(
-    source_id="example-source",
-    group=r"demo\group",
-    subject="example-quote-client",
-)
-```
+The operator renews the server certificate before expiration. A leaf certificate signed by the same CA does not require a new trust file; changing the CA requires a new operator-supplied certificate. Never work around expiration or trust failure by disabling TLS verification.
 
-`token` is the compact signed string to send to Bridge; `expires_at` is Unix UTC seconds for the client's renewal schedule. Do not print the token in shared logs. This example uses an unencrypted PEM protected by issuer filesystem permissions; an encrypted PEM requires the corresponding secret-management/password integration. Signing creates a credential, not an encrypted payload: JWT header and payload are readable by anyone holding it. Signing also does not encrypt `ws://` traffic.
+### Complete Python receiving example
 
-For every connection and renewal, call the function again with the same approved `sub` and scope. Do not cache one token indefinitely, change `exp` on an already signed string, or generate a new RSA key at each renewal. A valid signature is required after any payload change.
-
-The same function can supply the complete client's existing async token-provider interface. Run this adapter from the repository root after defining the function above; the private `config.json` must specify the same source/group and issuer values:
+The packaged viewer already executes this flow through `python start.py`. For a backend without the browser, run the following from the package directory. It reuses the same token acquisition, renewal and reconnect code:
 
 ```python
 import asyncio
 import json
-from aiohttp import web
-from quoteviewer import QuoteFeed, Token, create_app
+from pathlib import Path
+import ssl
 
-config = json.loads(Path("config.json").read_text())
+from quoteviewer import ClientCredentialsTokenProvider, QuoteFeed
 
-async def issue_token():
-    value, expiry = await asyncio.to_thread(
-        issue_quote_token,
-        source_id=config["sourceId"],
-        group=config["group"],
-        subject=config["auth"]["subject"],
+class BackendFeed(QuoteFeed):
+    def observe(self, value, raw):
+        super().observe(value, raw)
+        # 在此更新业务缓存；耗时处理应交给有界队列，避免阻塞接收。
+        print(json.dumps(value, ensure_ascii=False), flush=True)
+
+async def main():
+    config_path = Path("config.json").resolve()
+    config = json.loads(config_path.read_text())
+    ca_file = config.get("tlsCaFile")
+    tls = ssl.create_default_context(
+        cafile=str(config_path.parent / ca_file) if ca_file else None
     )
-    return Token(value, expiry)
+    tokens = ClientCredentialsTokenProvider(config, config_path.parent, tls)
+    feed = BackendFeed(config, tokens, tls)
+    await feed.run()
 
-feed = QuoteFeed(config, issue_token)
-web.run_app(
-    create_app(feed), host="localhost", port=config.get("httpPort", 8877),
-    access_log=None,
-)
+asyncio.run(main())
 ```
 
-`QuoteFeed` sends the group subscription, receives prices, renews on the same socket and preserves stale cache on a genuine disconnect. For ordinary use, `python start.py` already performs this setup with the configured `TokenIssuer`; there is no need to maintain a second signing implementation.
-
-References for the library calls: [OpenSSL RSA key generation](https://docs.openssl.org/3.0/man1/openssl-genpkey/) and [PyJWT RS256 signing](https://pyjwt.readthedocs.io/en/stable/usage.html#encoding-decoding-tokens-with-rs256-rsa). Bridge-specific claims and restrictions are defined below.
-
-### Signing and verification
-
-Use a signed compact JWT with RSA SHA-256 and PKCS#1 v1.5 padding (`RS256`). Bridge requires an RSA public key of at least 2048 bits. The private key stays with the authorized issuer; Bridge stores only the public verification key.
-
-Header:
-
-```json
-{"alg":"RS256","typ":"JWT","kid":"example-key"}
-```
-
-| Header field | Required rule |
-| --- | --- |
-| `alg` | Exactly `RS256`; unsigned tokens and other algorithms are rejected |
-| `typ` | Exactly `JWT` |
-| `kid` | Nonblank string, at most 256 characters; must match a configured verification key |
-
-The [Python signing function](#generate-a-jwt-in-python) constructs the payload and signs it. The `TokenIssuer` in [quoteviewer.py](../quoteviewer.py) uses the same fields with deployment values from the private configuration.
-
-| Claim | Required rule |
-| --- | --- |
-| `iss` | Exact configured issuer |
-| `aud` | Exactly one audience matching the configured audience; a string or a single-element string array |
-| `sub` | Nonblank caller ID, at most 256 characters; becomes Bridge's `CallerId` |
-| `jti` | Nonblank token ID, at most 256 characters; issue a new ID for each token |
-| `iat`, `nbf`, `exp` | Integer Unix UTC seconds, not milliseconds or strings |
-| `mt5bridge_grant` | A JSON object, not a JSON-encoded string |
-| `mt5bridge_grant.version` | A nonblank grant-version string; examples use `"1"` |
-| `referenceReads` | An array of explicitly authorized source/group/symbol scopes |
-
-Time validation is strict:
-
-- `exp > iat`, `nbf <= exp` and `exp - iat <= MaximumTokenLifetime`.
-- `iat` and `nbf` may be ahead of the verifier's clock by at most `ClockSkew`.
-- `iat - nbf <= ClockSkew`.
-- **`exp <= now` is expired immediately. Clock skew does not grant extra time after expiry.**
-- Defaults: maximum lifetime 120 seconds and clock skew 15 seconds. Configuration ceilings are 300 seconds and 30 seconds respectively. A deployment can impose shorter values.
-
-Keep issuer and Bridge clocks synchronized. Do not solve expiry by issuing a day-long token: the configured maximum lifetime is enforced.
-
-JWTs default to a maximum of 32 KiB of UTF-8 bytes; a deployment can set a lower limit. Authorization items across the grant are limited to 1,024. Optional grant arrays can be omitted and then default to empty, but cannot be `null`. Duplicate JSON properties, unsupported grant fields and invalid grant shapes are rejected. No account or trading permission is needed for the quote-only grant above.
-
-The validator can report revoked credentials when its revocation store rejects a `jti`. This integration does not define an online revocation API or promise immediate external revocation propagation. Short-lived tokens and absolute expiry remain authorization boundaries.
-
-### Group and symbol scope
-
-For all symbols in one group, include this single grant item:
-
-```json
-{"sourceId":"example-source","group":"demo\\group","symbol":null}
-```
-
-`symbol: null` grants that group's catalog and symbols. It avoids enumerating hundreds of symbols in the JWT. It is not a wildcard for other groups or sources. Do not send the string `"null"`, an empty string or `"*"` instead of JSON `null`.
-
-A grant item with an exact symbol can authorize that group/symbol combination, but cannot authorize `{"all":true}`. Source-level symbol access uses `group: null` and the exact symbol; it does not authorize group pricing. Keep the endpoint's source and group identical to the token scope.
-
-For key rotation, the operator must trust the replacement public key before tokens signed with its `kid` are used. A successful renewal still requires the same caller ID and all active scopes.
+Authorization acknowledgments are handled by `QuoteFeed`; `observe` receives only quote/context messages. The example prints market data, never JWTs. Production consumers should choose their own logging volume and cache/distribution behavior. The in-memory cache survives a network reconnect, not a process restart; persistence and tick replay are not provided by this client.
 
 ## 3. WebSocket URL and initial subscription
 
@@ -265,7 +142,7 @@ wss://quotes.example.com/v1/sources/example-source/quotes/stream?group=demo%5Cgr
 
 Build it from the actual base URL and **URL-encode** the source path segment and group query value. A JSON group `"demo\\group"` represents one backslash; its URL encoding is `demo%5Cgroup`. Do not URL-encode the group inside the JWT.
 
-An IP-and-port deployment uses the same path and query with the operator's base URL, `ws://<host>:<port>`. No domain name or SSH connection is required. Replace both placeholders with the privately supplied values.
+An IP-and-port deployment uses the same path and query with the operator's base URL, `wss://<host>:<port>`. No domain name or SSH connection is required. Replace both placeholders with the privately supplied values.
 
 Send this header in the WebSocket upgrade request:
 
@@ -273,7 +150,7 @@ Send this header in the WebSocket upgrade request:
 Authorization: Bearer <fresh-signed-jwt>
 ```
 
-Use a backend WebSocket client that supports request headers. Do not put JWTs in URL query parameters. `ws://` uses HTTP without transport encryption, including for bearer tokens; `wss://` uses TLS. Use WSS when encrypted transport is required. This client does not provision TLS or expose a Bridge listener.
+Use a backend WebSocket client that supports request headers. Do not put JWTs in URL query parameters. This third-party flow requires WSS. Load the supplied CA file for a private-CA endpoint; keep certificate and host validation enabled.
 
 After upgrade, immediately send one UTF-8 JSON text message:
 
@@ -300,30 +177,6 @@ The symbol set is fixed for the life of the connection. Symbols later added to M
 | Single symbol | `symbol=<encoded-exact-name>` and optional `group` | None; receive quotes directly |
 
 In explicit-symbol mode, the array must be nonempty and every symbol must be authorized. Names retain their MT5 suffixes, are at most 256 characters and cannot contain a NUL character. Exact duplicates are deduplicated. A single unauthorized member rejects the entire set. Do not send a subscription frame after subscribing via the `symbol` URL parameter.
-
-### Minimal Python connection example
-
-```python
-import aiohttp
-from urllib.parse import quote, urlencode
-
-async def subscribe(bridge_url, source_id, group, token):
-    url = (bridge_url.rstrip("/") + "/v1/sources/"
-           + quote(source_id, safe="") + "/quotes/stream?"
-           + urlencode({"group": group}))
-    async with aiohttp.ClientSession() as session:
-        async with session.ws_connect(
-            url, headers={"Authorization": "Bearer " + token}
-        ) as ws:
-            await ws.send_json({"all": True})
-            async for frame in ws:
-                if frame.type == aiohttp.WSMsgType.TEXT:
-                    print(frame.data)
-```
-
-This excerpt shows direct connection and initial subscription; it stops receiving when authorization expires unless renewal is added. The complete `QuoteFeed` in [quoteviewer.py](../quoteviewer.py) obtains fresh tokens concurrently, sends `{"type":"authorization","token":"..."}` on the same socket, waits for acknowledgment, enforces the active expiry and reconnects after genuine disconnection. Do not use this minimal excerpt as a long-running client without that renewal behavior.
-
-The complete viewer uses `TokenIssuer` to sign locally in an approved backend. If an authenticated token service already exists, pass an async token provider to `QuoteFeed(config, issue_token)` that returns `Token(value, expires_at)`. `expires_at` is integer or fractional Unix UTC seconds. The provider must return a fresh, correctly scoped token each time; the protocol does not supply a standard token-service URL.
 
 ## 4. Incoming quote and context messages
 
@@ -399,7 +252,7 @@ A new JWT must have the same `sub`/caller ID and cover **every active subscribed
 
 Before the active authorization expires:
 
-1. Obtain a fresh token while the receive loop keeps running.
+1. Repeat `POST /v1/quote-tokens` with the same client credential while the receive loop keeps running.
 2. Send the following on the existing WebSocket. Send the raw token without the `Bearer ` prefix.
 3. Wait for the authorization acknowledgment while continuing to process quotes.
 4. Only after `accepted`, replace the active expiry with the server's `expiresAt` and schedule the next renewal.
@@ -418,7 +271,7 @@ There is no resubscription, cache reset or connection replacement on successful 
 
 The client message permits only `type` and `token`, without extra or duplicate properties, at a maximum JSON depth of 4. The token must be nonblank, contain no NUL and fit the configured token limit (at most 32 KiB). The complete renewal message must fit 33 KiB. Fragmentation does not reset the size bound. Keep at most one renewal pending per connection.
 
-QuoteViewer starts renewal up to 30 seconds before expiry (one third of the remaining lifetime for shorter credentials). Its token-provider timeout is 30 seconds and acknowledgment timeout is 10 seconds, both bounded by the active authorization expiry. The active expiry is updated only after a successful server acknowledgment. These are **client policies**, not a Bridge SLA. Size the lead time for the actual token-service and network latency.
+QuoteViewer starts renewal up to 30 seconds before expiry (one third of the remaining lifetime for shorter credentials). The HTTP token request has a 15-second timeout, the provider call is bounded by 30 seconds and acknowledgment timeout is 10 seconds, both bounded by the active authorization expiry. The active expiry is updated only after a successful server acknowledgment. These are **client policies**, not a Bridge SLA. Size the lead time for the actual token-service and network latency.
 
 ### Rejection behavior
 

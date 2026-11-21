@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from decimal import Decimal
 import json
 from pathlib import Path
+import ssl
 import time
 from urllib.parse import quote, urlencode, urlsplit
 import uuid
@@ -70,10 +71,46 @@ class TokenIssuer:
         return Token(value, payload["exp"])
 
 
+class ClientCredentialsTokenProvider:
+    """Obtain a fixed-scope JWT without holding a signing key."""
+
+    def __init__(self, config, config_directory, ssl_context):
+        auth = config["auth"]
+        self.url = auth["tokenUrl"]
+        if urlsplit(self.url).scheme != "https" or urlsplit(config["bridgeUrl"]).scheme != "wss":
+            raise ValueError("Client credentials require HTTPS and WSS")
+        secret = (config_directory / auth["clientSecretFile"]).read_text().strip()
+        if not auth["clientId"] or not secret:
+            raise ValueError("Client credentials are missing")
+        self.authorization = aiohttp.encode_basic_auth(auth["clientId"], secret)
+        self.ssl = ssl_context
+
+    async def __call__(self):
+        try:
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as session:
+                async with session.post(
+                    self.url, headers={"Authorization": self.authorization}, data={"grant_type": "client_credentials"},
+                    ssl=self.ssl, allow_redirects=False,
+                ) as response:
+                    if response.status != 200:
+                        raise FeedError(f"获取 Token 失败：HTTP {response.status}")
+                    value = await response.json()
+            token, expiry = value["access_token"], value["expires_at"]
+            if (value["token_type"] != "Bearer" or not isinstance(token, str) or not token
+                    or type(expiry) is not int or expiry <= time.time()):
+                raise ValueError("Invalid token response")
+            return Token(token, expiry)
+        except aiohttp.ClientError as error:
+            raise FeedError(f"Token 请求失败（{type(error).__name__}）") from None
+        except (ValueError, KeyError, TypeError):
+            raise FeedError("Token 接口返回了无效或已过期的授权。") from None
+
+
 class QuoteFeed:
-    def __init__(self, config, issue_token):
+    def __init__(self, config, issue_token, ssl_context=None):
         self.config = config
         self.issue_token = issue_token
+        self.ssl = ssl_context if ssl_context is not None else True
         self.url = (config["bridgeUrl"].rstrip("/") + "/v1/sources/"
                     + quote(config["sourceId"], safe="") + "/quotes/stream?"
                     + urlencode({"group": config["group"]}))
@@ -149,6 +186,7 @@ class QuoteFeed:
                         async with asyncio.timeout(15):
                             socket = await session.ws_connect(
                                 self.url, headers={"Authorization": "Bearer " + token.value},
+                                ssl=self.ssl,
                             )
                         async with socket:
                             await socket.send_json({"all": True})
@@ -279,15 +317,19 @@ def main():
     parser.add_argument("--config", type=Path, default=ROOT / "config.json")
     args = parser.parse_args()
     if not args.config.exists():
-        parser.error("Copy config.example.json to config.json and configure your authorized endpoint and signing key.")
+        parser.error("Use the operator-supplied config.json, client credential and TLS certificate.")
     config = json.loads(args.config.read_text())
     if urlsplit(config["bridgeUrl"]).scheme not in ("ws", "wss"):
         parser.error("bridgeUrl must use ws:// or wss://")
     try:
-        issuer = TokenIssuer(config, args.config.resolve().parent)
+        config_directory = args.config.resolve().parent
+        ca_file = config.get("tlsCaFile")
+        ssl_context = ssl.create_default_context(cafile=str(config_directory / ca_file) if ca_file else None)
+        issuer = (ClientCredentialsTokenProvider(config, config_directory, ssl_context)
+                  if "tokenUrl" in config["auth"] else TokenIssuer(config, config_directory))
     except (OSError, ValueError, KeyError) as error:
-        parser.error(f"Check auth configuration and the authorized RSA private key ({type(error).__name__}).")
-    feed = QuoteFeed(config, issuer)
+        parser.error(f"Check auth configuration, credential file and TLS certificate ({type(error).__name__}).")
+    feed = QuoteFeed(config, issuer, ssl_context)
     web.run_app(create_app(feed), host="localhost", port=config.get("httpPort", 8877), access_log=None)
 
 

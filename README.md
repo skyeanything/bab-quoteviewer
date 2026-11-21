@@ -1,88 +1,81 @@
 # BAB QuoteViewer
 
-A **Python client that connects directly to MT5 Bridge over WS/WSS**. It is an integration example for another App's backend and includes a local browser table for inspecting live prices.
+A Python example for an App backend that receives MT5 group quotes over one WebSocket. It obtains short-lived JWTs with an independent client ID and secret, renews authorization on the existing connection, and displays received prices in a local browser.
 
-One WebSocket subscribes to all symbols in one authorized MT5 account group. JWTs renew on the same connection. The client needs **Python 3.11 or later** and the packages in `requirements.txt`. It does not use SSH, remote commands, .NET, the MT5 terminal or the Manager SDK.
+Start with the [Chinese handoff guide](docs/partner-onboarding.zh-CN.md). The [API integration guide](docs/market-data-integration.md) defines token issuance, subscriptions, data fields, renewal and errors.
 
-Read the [market-data integration guide](docs/market-data-integration.md) for JWT claims, subscription frames, acknowledgments, freshness and error handling.
+## Private handoff files
 
-For a colleague handoff in Chinese, use the [step-by-step integration handbook](docs/partner-onboarding.zh-CN.md), including the prerequisites, responsibilities, key registration, token generation, renewal and quote handling.
+The operator supplies a private package with these files already populated:
 
-For JWT setup, see [who signs the token](docs/market-data-integration.md#who-issues-the-jwt), [how to register the public key](docs/market-data-integration.md#register-a-signing-key-once), and [the complete Python signing example](docs/market-data-integration.md#generate-a-jwt-in-python). Bridge verifies JWTs but does not provide a token-issuance endpoint. A registered signing key grants issuer trust; it is not a partner API key restricted to the sample group.
+| File | Purpose |
+| --- | --- |
+| `config.json` | Actual HTTPS/WSS endpoint, source, permitted group and client ID |
+| `secrets/client-secret.txt` | Independent client secret, kept on the receiving backend |
+| `certs/bridge-ca.pem` | Server trust certificate when the endpoint uses a private CA |
 
-## What the operator must supply
+The credential is bound to one source/group on the server. Changing `config.json` does not grant access to another group. The partner does not generate signing keys or choose `iss`, `aud`, `kid` or `sub`; Bridge fills and signs those fields. No account, trading or funding permission is issued.
 
-- A reachable WebSocket base URL, such as `wss://quotes.example.com`, or `ws://<host>:<port>` for an operator-provided HTTP listener. `<host>` can be an IP address.
-- The configured `sourceId` and exact MT5 account-group name.
-- Agreed JWT issuer, audience, key ID and stable caller ID.
-- A signing arrangement: the operator must already trust the RSA public key used by this backend, or your backend must obtain tokens from an existing authenticated issuer.
-
-A loopback-only Bridge listener is not an external integration endpoint. Confirm the supplied listener is reachable from the consumer's network before treating this example as an end-to-end deployment acceptance. `ws://` carries JWTs and quotes without transport encryption; `wss://` uses TLS. All values in this repository are placeholders; request real deployment details privately.
+This public repository contains placeholders only. A public clone by itself cannot connect to a private deployment. Do not commit the private package, credentials or actual server certificate.
 
 ## Run
 
-Use a Python executable that is version 3.11 or newer; some operating systems ship an older `python3`.
+Install **Python 3.11 or later**, extract the private package, then run from its directory:
+
+macOS / Linux:
+
+```sh
+sh start.sh
+```
+
+Windows:
+
+```bat
+start.cmd
+```
+
+The launcher creates `.venv`, installs the pinned dependencies and runs the client. First use requires access to the Python package index. It does not install Python itself. No SSH, .NET SDK, MT5 terminal or Manager SDK is needed.
+
+Open [the local viewer](http://localhost:8877). Leave the Python process running. Stop it with Ctrl+C. The page displays connection count, renewal count, latest quotes and freshness; JWTs and client secrets remain in the Python process.
+
+Manual setup:
 
 ```sh
 python3 -m venv .venv
-source .venv/bin/activate
-python -m pip install -r requirements.txt
-cp config.example.json config.json
+.venv/bin/python -m pip install -r requirements.txt
+.venv/bin/python start.py
 ```
 
-On Windows, activate the environment with `.venv\Scripts\Activate.ps1` and copy the configuration with `Copy-Item`.
+On Windows, use `.venv\Scripts\python.exe`. An external configuration can be supplied with `python start.py --config /path/to/config.json`.
 
-Edit `config.json`:
+## Configuration
 
 | Setting | Meaning |
 | --- | --- |
-| `bridgeUrl` | Direct `ws://` or `wss://` base URL, including the port when needed, without `/v1/...` |
-| `sourceId` | Authorized MT5 source identifier |
-| `group` | Exact account/pricing group, not an asset category |
-| `httpPort` | Local viewer port, default 8877 |
-| `auth.issuer`, `auth.audience`, `auth.keyId` | Values registered with Bridge |
-| `auth.subject` | Stable backend caller ID; kept unchanged on renewal |
-| `auth.privateKeyFile` | Protected RSA private-key path; relative to the configuration file |
-| `auth.lifetimeSeconds` | Token lifetime, default 120; must fit the operator's configured maximum |
+| `bridgeUrl` | Direct `wss://` base URL, including the supplied port; no API path |
+| `sourceId` | Exact source assigned by the operator |
+| `group` | Exact MT5 account/pricing group, not an asset category |
+| `httpPort` | Local viewer port; default 8877 |
+| `tlsCaFile` | Trust certificate path, relative to config; `null` uses system trust |
+| `auth.tokenUrl` | Full HTTPS URL of `POST /v1/quote-tokens` |
+| `auth.clientId` | Independent identifier assigned by the operator |
+| `auth.clientSecretFile` | Secret file path, relative to config |
 
-The included `TokenIssuer` signs an all-group, quote-read grant. Use it only inside an authorized backend. An arbitrary newly generated key will not be accepted by Bridge. Keep private keys out of the browser and repository; `config.json`, `*.local.json`, private-key files and `secrets/` are ignored by Git.
+The example config uses a placeholder domain. An IP and port work with a matching IP certificate in the operator's private package. Certificate and host verification remain enabled.
 
-```sh
-python start.py
-```
+## Client behavior and reuse
 
-Open [the local viewer](http://localhost:8877). To use an external configuration file:
+`ClientCredentialsTokenProvider` calls the token API with HTTP Basic authentication and `grant_type=client_credentials`. `QuoteFeed` authenticates the WebSocket with the resulting bearer token and sends `{"all":true}`. Before expiry, it requests another token and sends an authorization frame on the same socket. Only an accepted acknowledgment updates the active expiry.
 
-```sh
-python start.py --config /path/to/private-config.json
-```
+Normal renewal retains the connection and cache. A genuine disconnect keeps the latest prices marked stale and retries after five seconds. Freshness returns per symbol only after new data arrives. The cache is in memory; stopping the Python process clears it. The stream coalesces updates and does not replay every missed tick.
 
-Prices remain strings. Normal JWT renewal keeps both the connection and cache. A genuine disconnect retains prices as stale; each row becomes live again only when the new connection receives fresh data. The stream coalesces updates and does not replay all missed ticks.
+For another backend, reuse `ClientCredentialsTokenProvider` and `QuoteFeed`; the integration guide includes a complete receiving example without the browser. The legacy `TokenIssuer` remains for existing operator-controlled configurations and test fixtures. It is not used by the partner package and requires an operator-held signing key.
 
-## Use an existing token service
-
-`QuoteFeed(config, issue_token)` accepts an async callable that returns `Token(value, expires_at)`, where `expires_at` is Unix UTC seconds. Replace `TokenIssuer` with your backend's existing authenticated token acquisition code. Bridge does not define a public token endpoint; do not invent one or execute commands on the Bridge server to obtain credentials.
-
-The browser uses only the local `/api/state` and `/events` interfaces. JWTs and signing keys remain in the Python process. Runtime screens contain the configured endpoint and quote data, so review screenshots before sharing.
-
-## Review and verification
+## Verification
 
 ```sh
 python -m unittest discover -s tests -p 'test_*.py' -v
 node --test tests/ui.test.mjs
 ```
 
-Node is optional and only runs the existing UI regression test; it is not needed to run QuoteViewer. Python tests use a local WebSocket fixture with real RS256 signatures to check direct header authentication, group subscription, two token expiry boundaries, rejection without extending permission, and stale-cache recovery after a TCP disconnect. These tests do not certify the operator's public ingress or replace testing against a deployed Bridge.
-
-For live acceptance, observe at least two JWT renewals and the earlier tokens' original expiry times. Connection count must remain one, acknowledged expiry must advance, and active symbols must keep receiving updates. Closed markets and symbols without ticks can legitimately be stale or empty.
-
-| File | Purpose |
-| --- | --- |
-| `quoteviewer.py` | RS256 issuer, direct WebSocket client, cache and local HTTP/SSE adapter |
-| `start.py` | Python entry point |
-| `config.example.json` | Placeholder-only connection and JWT configuration |
-| `wwwroot/index.html` | Existing browser table and session status |
-| `tests/test_client.py` | Direct-connection protocol regression tests |
-| `docs/market-data-integration.md` | Detailed backend integration contract |
-
-Implementation references: [aiohttp client WebSockets](https://docs.aiohttp.org/en/stable/client_quickstart.html#websockets) and [PyJWT RS256](https://pyjwt.readthedocs.io/en/stable/usage.html#encoding-decoding-tokens-with-rs256-rsa).
+Node is only needed for the existing UI test. Python tests use verified local HTTPS/WSS, real RSA signatures, credential-based token issuance, two expiry boundaries, rejected renewal and cache recovery. Live deployment acceptance must additionally check the actual network endpoint, fixed group scope and ongoing quotes across token expiry.
