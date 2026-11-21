@@ -2,7 +2,7 @@
 
 This guide describes the ordinary third-party flow: use an independent client ID and secret to obtain a short-lived JWT, then receive all quotes in the assigned MT5 account group over one WebSocket. Bridge supplies and signs the JWT; the partner never receives a signing key.
 
-All addresses and identities in this public document are examples. The operator's **private handoff package** contains actual configuration, the independent credential and any required server trust certificate. Start with [the Chinese handoff guide](partner-onboarding.zh-CN.md) when forwarding the package to a colleague.
+All addresses and identities in this public document are examples. The operator supplies a private API handoff with actual endpoint parameters, an independent credential and the server trust certificate. The [Chinese API reference](partner-onboarding.zh-CN.md) is a complete, language-independent integration contract.
 
 ## 1. Components and onboarding
 
@@ -12,18 +12,20 @@ App backend <-- scoped, short-lived JWT -------- Bridge token endpoint
 MT5 --> Bridge -- one authenticated WSS stream --> App backend cache --> App users
 ```
 
-The receiving backend owns token acquisition, renewal and the latest-value cache. QuoteViewer implements this in Python and adds a local browser table. Install Python 3.11 or later; no SSH access, .NET SDK, MT5 terminal or Manager SDK is required.
+The receiving backend implements token acquisition, renewal and the latest-value cache in its existing code. Use an HTTP client and a WebSocket library that supports handshake headers and custom CA trust. No example application or particular programming language is required.
 
-The operator must supply these files through a private channel:
+The operator supplies four files through a private channel:
 
-| File/value | Purpose |
+| File | Purpose |
 | --- | --- |
-| `config.json` | Actual `bridgeUrl`, `auth.tokenUrl`, `sourceId`, `group`, `auth.clientId` and credential/certificate paths |
-| `secrets/client-secret.txt` | Unique, randomly generated client secret; store only on the receiving backend |
-| `certs/bridge-ca.pem` | Public trust certificate for a private-CA deployment; no private key |
-| Client code and dependencies | `quoteviewer.py`, launchers, `requirements.txt`, browser files and guides |
+| `行情接口文档.md` | API contract and the partner's assigned endpoint details |
+| `接入参数.json` | Full `tokenUrl`, full `webSocketUrl`, `clientId`, authorized `group`, `clientSecretFile` and `caCertificateFile` |
+| `client-secret.txt` | Unique client secret; read the value without its trailing newline |
+| `bridge-ca.pem` | Public trust certificate for this private-CA deployment; no private key |
 
-`sourceId` identifies the configured MT5 source. `group` is the exact MT5 **account/pricing group**, not an asset category such as metals or equities. Names are case-sensitive and retain backslashes/suffixes. The server binds the client credential to one source and group; editing the local config does not change permission.
+The parameter file records the assigned values; consumers can store them in their existing configuration and secret-management system. It does not prescribe an application configuration format.
+
+The operator embeds the required source path segment and URL-encoded group in the complete `webSocketUrl`. Use this URL directly; the consumer does not need to select or configure a separate `sourceId`. The existing wire protocol still includes `sourceId` in received messages. `group` is the exact MT5 account/pricing group, not an asset category. The server binds the credential to the approved source/group; changing the URL does not expand permission.
 
 The server supplies `iss` (issuer), `aud` (audience), `kid` (signing-key ID), `sub` (stable client identity), timestamps and the grant. A partner does not need to request these values, generate them or implement JWT signing. Treat the returned token as a bearer credential.
 
@@ -49,7 +51,7 @@ grant_type=client_credentials
 | `sourceId`, `group`, `scope`, `iss`, `aud`, `sub` | Do not send; additional form fields are rejected |
 | TLS | Required; validate the certificate chain and DNS name or IP SAN |
 
-Base64 is not encryption. The Python provider requires HTTPS for credentials and WSS for quotes, follows no token-endpoint redirects, and trusts the supplied CA file while retaining hostname/IP validation. Do not disable certificate verification. IP-and-port access works when the certificate contains that IP in its SAN.
+Base64 is not encryption. Use HTTPS for credentials and WSS for quotes. Load the supplied CA file in both clients and retain hostname/IP validation. Do not forward the client credential to a different redirect destination. Do not disable certificate verification. IP-and-port access works when the certificate contains that IP in its SAN.
 
 ### Success: HTTP 200
 
@@ -86,7 +88,7 @@ There is **no refresh token**. Before expiry, repeat the same credential-authent
 | 404 | Endpoint unavailable | Confirm URL and whether issuance is enabled in the deployed version |
 | 5xx / network failure | Service failure | Retry with delay while the current token remains valid; preserve stale quotes if it expires |
 
-Default token endpoint capacity is **60 requests per minute across the endpoint**, using fixed windows and no queue. This is configurable, not a per-client allowance. There is no `Retry-After` contract. One receiving backend normally requests a token about every 90 seconds with a 120-second token; do not create a token request per symbol or per App user.
+Default token endpoint capacity is **60 requests per minute across the endpoint**, using fixed windows and no queue. This is configurable, not a per-client allowance. There is no `Retry-After` contract. With a recommended 30-second renewal lead time, one receiving backend requests a token about every 90 seconds for a 120-second token; do not create a token request per symbol or per App user.
 
 ### Permission boundary and credential changes
 
@@ -94,43 +96,31 @@ The issued grant contains only one `referenceReads` entry for the server-configu
 
 The operator owns signing keys and the client registry. It stores SHA-256 of the high-entropy secret, compares it in constant time and derives the stable caller as `quote-client:<client_id>`. JWT signing uses the configured issuer/audience and a registered RSA key. Partners do not access these settings.
 
-For a secret rotation, the operator replaces the registered hash and delivers a replacement secret privately. For disablement, the operator disables the client. These configuration changes require a Bridge restart in this deployment; the client reconnects afterward. Existing signed JWTs are not independently revoked merely by changing the secret: they remain cryptographically valid until their original expiry, at most the configured lifetime. Do not promise instantaneous JWT revocation. The Python provider reads the secret at process startup; restart it after replacing the secret file.
+For a secret rotation, the operator replaces the registered hash and delivers a replacement secret privately. For disablement, the operator disables the client. These configuration changes require a Bridge restart in this deployment; the client reconnects afterward. Existing signed JWTs are not independently revoked merely by changing the secret: they remain cryptographically valid until their original expiry, at most the configured lifetime. Do not promise instantaneous JWT revocation. Update the credential in your own configuration system and ensure later token requests use the replacement value.
 
 The operator renews the server certificate before expiration. A leaf certificate signed by the same CA does not require a new trust file; changing the CA requires a new operator-supplied certificate. Never work around expiration or trust failure by disabling TLS verification.
 
-### Complete Python receiving example
+### Implementation flow in the consumer's code
 
-The packaged viewer already executes this flow through `python start.py`. For a backend without the browser, run the following from the package directory. It reuses the same token acquisition, renewal and reconnect code:
+```text
+POST tokenUrl with Basic client credentials and grant_type=client_credentials
+Connect webSocketUrl with Authorization: Bearer access_token
+Send {"all": true}
 
-```python
-import asyncio
-import json
-from pathlib import Path
-import ssl
+Keep one receive loop running:
+  quote/context -> update business cache and freshness state
+  authorization accepted -> install acknowledged expiry and schedule renewal
+  authorization rejected -> retain old expiry and classify the error
+  close/error -> mark cache stale, obtain a fresh token and reconnect
 
-from quoteviewer import ClientCredentialsTokenProvider, QuoteFeed
-
-class BackendFeed(QuoteFeed):
-    def observe(self, value, raw):
-        super().observe(value, raw)
-        # 在此更新业务缓存；耗时处理应交给有界队列，避免阻塞接收。
-        print(json.dumps(value, ensure_ascii=False), flush=True)
-
-async def main():
-    config_path = Path("config.json").resolve()
-    config = json.loads(config_path.read_text())
-    ca_file = config.get("tlsCaFile")
-    tls = ssl.create_default_context(
-        cafile=str(config_path.parent / ca_file) if ca_file else None
-    )
-    tokens = ClientCredentialsTokenProvider(config, config_path.parent, tls)
-    feed = BackendFeed(config, tokens, tls)
-    await feed.run()
-
-asyncio.run(main())
+Before active expiry, in a separate task:
+  POST tokenUrl again with the same client credential
+  Send {"type": "authorization", "token": new_access_token} on the same socket
+  Wait for acknowledgment through the existing receive loop
+  Do not extend active expiry until accepted
 ```
 
-Authorization acknowledgments are handled by `QuoteFeed`; `observe` receives only quote/context messages. The example prints market data, never JWTs. Production consumers should choose their own logging volume and cache/distribution behavior. The in-memory cache survives a network reconnect, not a process restart; persistence and tick replay are not provided by this client.
+Serialize sends on one socket and keep expensive business operations out of the receive loop. Reconnect, persistence and downstream distribution belong to the consumer's existing service. The stream supplies latest values and does not replay every missed tick.
 
 ## 3. WebSocket URL and initial subscription
 
@@ -140,7 +130,7 @@ The complete example URL is:
 wss://quotes.example.com/v1/sources/example-source/quotes/stream?group=demo%5Cgroup
 ```
 
-Build it from the actual base URL and **URL-encode** the source path segment and group query value. A JSON group `"demo\\group"` represents one backslash; its URL encoding is `demo%5Cgroup`. Do not URL-encode the group inside the JWT.
+The operator supplies the complete URL with the source path segment and group already encoded. Use that URL directly. A JSON group `"demo\\group"` represents one backslash; its URL encoding is `demo%5Cgroup`. JWT construction belongs to the token endpoint.
 
 An IP-and-port deployment uses the same path and query with the operator's base URL, `wss://<host>:<port>`. No domain name or SSH connection is required. Replace both placeholders with the privately supplied values.
 
@@ -150,7 +140,7 @@ Send this header in the WebSocket upgrade request:
 Authorization: Bearer <fresh-signed-jwt>
 ```
 
-Use a backend WebSocket client that supports request headers. Do not put JWTs in URL query parameters. This third-party flow requires WSS. Load the supplied CA file for a private-CA endpoint; keep certificate and host validation enabled.
+Use a backend WebSocket client that supports request headers. Do not put JWTs in URL query parameters. Use WSS for this credential-based integration. Load the supplied CA file for a private-CA endpoint; keep certificate and host validation enabled.
 
 After upgrade, immediately send one UTF-8 JSON text message:
 
@@ -238,13 +228,13 @@ The example values are not market data or a statement that MT5 time maps to UTC.
 
 Parse integer sequence and time fields without losing 64-bit precision. MT5 `datetime` and `datetimeMilliseconds` are server trading-time values whose UTC mapping is unverified; use `observedAt` for transport/freshness observations and do not silently reinterpret native timestamps.
 
-For a UI, a fresh row requires an active connection, a row received on that connection, `readiness == "ready"`, and an age below the supplied maximum. QuoteViewer estimates age as:
+For a UI, a fresh row requires an active connection, a row received on that connection, `readiness == "ready"`, and an age below the supplied maximum. When source age is known, the consumer can estimate age as:
 
 ```text
-max(0, localUtcNow - observedAt) + (sourceAgeMilliseconds ?? 0)
+max(0, localUtcNow - observedAt) + sourceAgeMilliseconds
 ```
 
-Use milliseconds throughout. A null source age is unknown, not proof that the source age is zero. The fallback above is the viewer's display estimate. Local clock error and network delay affect the estimate; never replace `observedAt` with local receive time to make delayed data look fresh.
+Use milliseconds throughout. A null source age is unknown; do not substitute zero as proof that the source is fresh. Local clock error and network delay affect the estimate; never replace `observedAt` with local receive time to make delayed data look fresh.
 
 ## 5. Renew JWTs on the existing connection
 
@@ -271,7 +261,7 @@ There is no resubscription, cache reset or connection replacement on successful 
 
 The client message permits only `type` and `token`, without extra or duplicate properties, at a maximum JSON depth of 4. The token must be nonblank, contain no NUL and fit the configured token limit (at most 32 KiB). The complete renewal message must fit 33 KiB. Fragmentation does not reset the size bound. Keep at most one renewal pending per connection.
 
-QuoteViewer starts renewal up to 30 seconds before expiry (one third of the remaining lifetime for shorter credentials). The HTTP token request has a 15-second timeout, the provider call is bounded by 30 seconds and acknowledgment timeout is 10 seconds, both bounded by the active authorization expiry. The active expiry is updated only after a successful server acknowledgment. These are **client policies**, not a Bridge SLA. Size the lead time for the actual token-service and network latency.
+A recommended client policy is to begin renewal about 30 seconds before expiry for a 120-second token. Bound token requests and acknowledgment waits by the remaining active lifetime, and retry transient failures with a delay. These are implementation recommendations, not a Bridge SLA. The active expiry changes only after an accepted acknowledgment.
 
 ### Rejection behavior
 
@@ -292,7 +282,7 @@ On rejection, `expiresAt` remains the old authorization's expiry. A failure does
 | `grant_validation_timeout` | Credential validation exceeded its budget |
 | `grant_validation_unavailable` | Credential validation is unavailable |
 
-Do not retry the same permanent caller/scope error indefinitely. QuoteViewer reports rejection and retries after 5 seconds while the old authorization remains valid; the server's failure limit still applies. An App backend should classify permanent and transient failures according to its token service. Never label an expired/disconnected connection as live.
+Do not retry permanent caller/scope errors indefinitely. Classify temporary failures, back off while the old authorization remains valid, and respect the server failure limit. Never label an expired or disconnected connection as live.
 
 ## 6. Errors, reconnects and delivery guarantees
 
@@ -319,7 +309,7 @@ An oversized initial subscription also closes with `1009`; failing to send the f
 For a genuine disconnect:
 
 1. Mark the connection and cached prices stale immediately. Preserve the last values for display, with an explicit disconnected/recovering indicator.
-2. Retry with a delay and obtain a fresh authorized token. In a fleet of consumers, use bounded backoff and jitter to avoid simultaneous reconnects; QuoteViewer uses a fixed 5-second delay as a local diagnostic tool.
+2. Retry with a delay and obtain a fresh authorized token. In a fleet of consumers, use bounded backoff and jitter to avoid simultaneous reconnects.
 3. Open one new connection and submit the subscription again.
 4. Restore live status per symbol only after fresh data arrives on the new connection.
 

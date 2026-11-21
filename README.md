@@ -1,12 +1,14 @@
 # BAB QuoteViewer
 
-A Python example for an App backend that receives MT5 group quotes over one WebSocket. It obtains short-lived JWTs with an independent client ID and secret, renews authorization on the existing connection, and displays received prices in a local browser.
+A repository containing the market-data API reference and an optional Python diagnostic viewer.
 
-Start with the [Chinese handoff guide](docs/partner-onboarding.zh-CN.md). The [API integration guide](docs/market-data-integration.md) defines token issuance, subscriptions, data fields, renewal and errors.
+To integrate into an existing backend, use the [Chinese API reference](docs/partner-onboarding.zh-CN.md) or [English API reference](docs/market-data-integration.md). They define the HTTP/WebSocket protocol without depending on this viewer. The operator supplies the API document, assigned connection parameters, client secret and CA certificate privately.
 
-## Private handoff files
+The remaining instructions are for running the optional diagnostic viewer.
 
-The operator supplies a private package with these files already populated:
+## Diagnostic viewer configuration
+
+The diagnostic viewer reads these private files:
 
 | File | Purpose |
 | --- | --- |
