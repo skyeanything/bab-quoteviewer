@@ -3,9 +3,12 @@
   "sourceId": "example-source",
   "group": "demo\\group",
   "httpPort": 8877,
-  "tokenCommand": [
-    "dotnet",
-    "examples/TokenIssuer/bin/Release/net10.0/TokenIssuer.dll",
-    "issuer.local.json"
-  ]
+  "auth": {
+    "issuer": "example-backend",
+    "audience": "example-bridge",
+    "keyId": "example-key",
+    "subject": "example-quote-client",
+    "privateKeyFile": "secrets/signing-key.pem",
+    "lifetimeSeconds": 120
+  }
 }

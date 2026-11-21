@@ -12,13 +12,13 @@ MT5 → Bridge → one backend WebSocket → App backend cache → App users
                 short-lived JWTs from a trusted issuer
 ```
 
-The receiving backend owns the connection, token renewal and latest-value cache. It can distribute its authorized prices to its own clients. QuoteViewer implements the receiving side and adds a local browser table for verification.
+The receiving backend owns the direct WS/WSS connection, token renewal and latest-value cache. It can distribute its authorized prices to its own clients. QuoteViewer implements this in Python and adds a local browser table for verification. No SSH access or .NET installation is required. The operator must provide a reachable endpoint; a loopback-only listener is not sufficient for an external consumer.
 
 Agree on these values with the Bridge operator before connecting:
 
 | Value | Meaning |
 | --- | --- |
-| WebSocket base URL | The reachable `wss://` endpoint; TLS/ingress is configured by the operator |
+| WebSocket base URL | The reachable `ws://` or `wss://` endpoint, including its port; listener and TLS configuration belong to the operator |
 | `sourceId` | An opaque identifier for one configured MT5 source; it is not an account login or symbol |
 | `group` | The exact MT5 account-group name used for group pricing |
 | `iss` and `aud` | The issuer and audience registered in Bridge |
@@ -69,7 +69,7 @@ const payload = {
 };
 ```
 
-This block shows claim construction, not JWT signing. The [runnable C# issuer](../examples/TokenIssuer/Program.cs) signs these claims and returns a fresh token to QuoteViewer.
+This block shows claim construction, not JWT signing. The `TokenIssuer` in [quoteviewer.py](../quoteviewer.py) signs these claims locally in the authorized Python backend and returns a fresh token to QuoteViewer. `config.example.json` documents the issuer settings; the signing key must already be trusted by Bridge.
 
 | Claim | Required rule |
 | --- | --- |
@@ -120,13 +120,15 @@ wss://quotes.example.com/v1/sources/example-source/quotes/stream?group=demo%5Cgr
 
 Build it from the actual base URL and **URL-encode** the source path segment and group query value. A JSON group `"demo\\group"` represents one backslash; its URL encoding is `demo%5Cgroup`. Do not URL-encode the group inside the JWT.
 
+An IP-and-port deployment uses the same path and query with the operator's base URL, `ws://<host>:<port>`. No domain name or SSH connection is required. Replace both placeholders with the privately supplied values.
+
 Send this header in the WebSocket upgrade request:
 
 ```http
 Authorization: Bearer <fresh-signed-jwt>
 ```
 
-Use a backend WebSocket client that supports request headers. Do not put JWTs in URL query parameters. Use WSS for traffic outside a protected local transport; this client does not provision TLS or expose a Bridge listener.
+Use a backend WebSocket client that supports request headers. Do not put JWTs in URL query parameters. `ws://` uses HTTP without transport encryption, including for bearer tokens; `wss://` uses TLS. Use WSS when encrypted transport is required. This client does not provision TLS or expose a Bridge listener.
 
 After upgrade, immediately send one UTF-8 JSON text message:
 
@@ -154,24 +156,29 @@ The symbol set is fixed for the life of the connection. Symbols later added to M
 
 In explicit-symbol mode, the array must be nonempty and every symbol must be authorized. Names retain their MT5 suffixes, are at most 256 characters and cannot contain a NUL character. Exact duplicates are deduplicated. A single unauthorized member rejects the entire set. Do not send a subscription frame after subscribing via the `symbol` URL parameter.
 
-### Minimal .NET connection example
+### Minimal Python connection example
 
-```csharp
-using System.Net.WebSockets;
-using System.Text;
+```python
+import aiohttp
+from urllib.parse import quote, urlencode
 
-using var socket = new ClientWebSocket();
-socket.Options.SetRequestHeader("Authorization", "Bearer " + jwt);
-var url = bridgeBaseUrl.TrimEnd('/')
-    + "/v1/sources/" + Uri.EscapeDataString(sourceId)
-    + "/quotes/stream?group=" + Uri.EscapeDataString(group);
-await socket.ConnectAsync(new Uri(url), cancellationToken);
-await socket.SendAsync(Encoding.UTF8.GetBytes("{\"all\":true}"),
-    WebSocketMessageType.Text, true, cancellationToken);
-// 持续接收并按 type 分发；在旧授权到期前，通过同一连接发送续期消息。
+async def subscribe(bridge_url, source_id, group, token):
+    url = (bridge_url.rstrip("/") + "/v1/sources/"
+           + quote(source_id, safe="") + "/quotes/stream?"
+           + urlencode({"group": group}))
+    async with aiohttp.ClientSession() as session:
+        async with session.ws_connect(
+            url, headers={"Authorization": "Bearer " + token}
+        ) as ws:
+            await ws.send_json({"all": True})
+            async for frame in ws:
+                if frame.type == aiohttp.WSMsgType.TEXT:
+                    print(frame.data)
 ```
 
-This excerpt establishes the subscription only. Use [QuoteFeed.cs](../QuoteFeed.cs) for a complete receive loop, fragmented-message assembly, concurrent token acquisition, renewal acknowledgments and reconnect handling. Keep one receiver and serialize application sends. Do not block quote reception while obtaining a new token.
+This excerpt shows direct connection and initial subscription; it stops receiving when authorization expires unless renewal is added. The complete `QuoteFeed` in [quoteviewer.py](../quoteviewer.py) obtains fresh tokens concurrently, sends `{"type":"authorization","token":"..."}` on the same socket, waits for acknowledgment, enforces the active expiry and reconnects after genuine disconnection. Do not use this minimal excerpt as a long-running client without that renewal behavior.
+
+The complete viewer uses `TokenIssuer` to sign locally in an approved backend. If an authenticated token service already exists, pass an async token provider to `QuoteFeed(config, issue_token)` that returns `Token(value, expires_at)`. `expires_at` is integer or fractional Unix UTC seconds. The provider must return a fresh, correctly scoped token each time; the protocol does not supply a standard token-service URL.
 
 ## 4. Incoming quote and context messages
 
@@ -266,7 +273,7 @@ There is no resubscription, cache reset or connection replacement on successful 
 
 The client message permits only `type` and `token`, without extra or duplicate properties, at a maximum JSON depth of 4. The token must be nonblank, contain no NUL and fit the configured token limit (at most 32 KiB). The complete renewal message must fit 33 KiB. Fragmentation does not reset the size bound. Keep at most one renewal pending per connection.
 
-QuoteViewer starts renewal up to 30 seconds before expiry (one third of the remaining lifetime for shorter credentials). Its token-provider timeout is 30 seconds and acknowledgment timeout is 10 seconds, both bounded by the active authorization expiry. These are **client policies**, not a Bridge SLA. Size the lead time for the actual token-service and network latency.
+QuoteViewer starts renewal up to 30 seconds before expiry (one third of the remaining lifetime for shorter credentials). Its token-provider timeout is 30 seconds and acknowledgment timeout is 10 seconds, both bounded by the active authorization expiry. The active expiry is updated only after a successful server acknowledgment. These are **client policies**, not a Bridge SLA. Size the lead time for the actual token-service and network latency.
 
 ### Rejection behavior
 
