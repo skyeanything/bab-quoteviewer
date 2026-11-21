@@ -77,8 +77,6 @@ class ClientCredentialsTokenProvider:
     def __init__(self, config, config_directory, ssl_context):
         auth = config["auth"]
         self.url = auth["tokenUrl"]
-        if urlsplit(self.url).scheme != "https" or urlsplit(config["bridgeUrl"]).scheme != "wss":
-            raise ValueError("Client credentials require HTTPS and WSS")
         secret = (config_directory / auth["clientSecretFile"]).read_text().strip()
         if not auth["clientId"] or not secret:
             raise ValueError("Client credentials are missing")

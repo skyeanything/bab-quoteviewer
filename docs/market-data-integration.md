@@ -2,26 +2,25 @@
 
 This guide describes the ordinary third-party flow: use an independent client ID and secret to obtain a short-lived JWT, then receive all quotes in the assigned MT5 account group over one WebSocket. Bridge supplies and signs the JWT; the partner never receives a signing key.
 
-All addresses and identities in this public document are examples. The operator supplies a private API handoff with actual endpoint parameters, an independent credential and the server trust certificate. The [Chinese API reference](partner-onboarding.zh-CN.md) is a complete, language-independent integration contract.
+All addresses and identities in this public document are examples. The operator supplies a private API handoff with actual endpoint parameters and an independent credential. The [Chinese API reference](partner-onboarding.zh-CN.md) is a complete, language-independent integration contract.
 
 ## 1. Components and onboarding
 
 ```text
-App backend -- client ID + secret over HTTPS --> Bridge token endpoint
+App backend -- client ID + secret over HTTP --> Bridge token endpoint
 App backend <-- scoped, short-lived JWT -------- Bridge token endpoint
-MT5 --> Bridge -- one authenticated WSS stream --> App backend cache --> App users
+MT5 --> Bridge -- one authenticated WS stream --> App backend cache --> App users
 ```
 
-The receiving backend implements token acquisition, renewal and the latest-value cache in its existing code. Use an HTTP client and a WebSocket library that supports handshake headers and custom CA trust. No example application or particular programming language is required.
+The receiving backend implements token acquisition, renewal and the latest-value cache in its existing code. Use an HTTP client and a WebSocket library that supports handshake headers. No example application or particular programming language is required.
 
-The operator supplies four files through a private channel:
+The operator supplies three files through a private channel:
 
 | File | Purpose |
 | --- | --- |
 | `行情接口文档.md` | API contract and the partner's assigned endpoint details |
-| `接入参数.json` | Full `tokenUrl`, full `webSocketUrl`, `clientId`, authorized `group`, `clientSecretFile` and `caCertificateFile` |
+| `接入参数.json` | Full `tokenUrl`, full `webSocketUrl`, `clientId`, authorized `group` and `clientSecretFile` |
 | `client-secret.txt` | Unique client secret; read the value without its trailing newline |
-| `bridge-ca.pem` | Public trust certificate for this private-CA deployment; no private key |
 
 The parameter file records the assigned values; consumers can store them in their existing configuration and secret-management system. It does not prescribe an application configuration format.
 
@@ -43,15 +42,14 @@ grant_type=client_credentials
 
 | Item | Contract |
 | --- | --- |
-| URL | Full operator-supplied HTTPS token URL; path `/v1/quote-tokens` |
+| URL | Full operator-supplied HTTP token URL; path `/v1/quote-tokens` |
 | Authentication | HTTP Basic; UTF-8 `client_id:client_secret`, then Base64 |
 | `client_id` | Operator-assigned identifier, at most 64 ASCII letters/digits or `-_.` |
 | `client_secret` | Operator-supplied random secret; never a JWT or signing key |
 | Body | Exactly one field: `grant_type=client_credentials` |
 | `sourceId`, `group`, `scope`, `iss`, `aud`, `sub` | Do not send; additional form fields are rejected |
-| TLS | Required; validate the certificate chain and DNS name or IP SAN |
 
-Base64 is not encryption. Use HTTPS for credentials and WSS for quotes. Load the supplied CA file in both clients and retain hostname/IP validation. Do not forward the client credential to a different redirect destination. Do not disable certificate verification. IP-and-port access works when the certificate contains that IP in its SAN.
+Use the supplied HTTP token URL and WS quote URL on the same IP and port `54013`. Do not forward the client credential to a different redirect destination.
 
 ### Success: HTTP 200
 
@@ -81,7 +79,6 @@ There is **no refresh token**. Before expiry, repeat the same credential-authent
 
 | HTTP status | Body/code | Action |
 | --- | --- | --- |
-| 400 | `{"error":"https_required"}` | Use the supplied HTTPS endpoint |
 | 400 | `{"error":"invalid_request"}` | Check form content type and the single `grant_type` field |
 | 401 | `{"error":"invalid_client"}` | Check the supplied client ID/secret or ask the operator to check enabled status; response has a Basic authentication challenge |
 | 429 | `{"code":"capacity_limit_reached","workClass":null}` | Back off; do not run a tight retry loop |
@@ -97,8 +94,6 @@ The issued grant contains only one `referenceReads` entry for the server-configu
 The operator owns signing keys and the client registry. It stores SHA-256 of the high-entropy secret, compares it in constant time and derives the stable caller as `quote-client:<client_id>`. JWT signing uses the configured issuer/audience and a registered RSA key. Partners do not access these settings.
 
 For a secret rotation, the operator replaces the registered hash and delivers a replacement secret privately. For disablement, the operator disables the client. These configuration changes require a Bridge restart in this deployment; the client reconnects afterward. Existing signed JWTs are not independently revoked merely by changing the secret: they remain cryptographically valid until their original expiry, at most the configured lifetime. Do not promise instantaneous JWT revocation. Update the credential in your own configuration system and ensure later token requests use the replacement value.
-
-The operator renews the server certificate before expiration. A leaf certificate signed by the same CA does not require a new trust file; changing the CA requires a new operator-supplied certificate. Never work around expiration or trust failure by disabling TLS verification.
 
 ### Implementation flow in the consumer's code
 
@@ -127,12 +122,12 @@ Serialize sends on one socket and keep expensive business operations out of the 
 The complete example URL is:
 
 ```text
-wss://quotes.example.com/v1/sources/example-source/quotes/stream?group=demo%5Cgroup
+ws://quotes.example.com:54013/v1/sources/example-source/quotes/stream?group=demo%5Cgroup
 ```
 
 The operator supplies the complete URL with the source path segment and group already encoded. Use that URL directly. A JSON group `"demo\\group"` represents one backslash; its URL encoding is `demo%5Cgroup`. JWT construction belongs to the token endpoint.
 
-An IP-and-port deployment uses the same path and query with the operator's base URL, `wss://<host>:<port>`. No domain name or SSH connection is required. Replace both placeholders with the privately supplied values.
+An IP-and-port deployment uses the same path and query with the operator's base URL, `ws://<host>:54013`. No domain name or SSH connection is required. Replace the host placeholder with the privately supplied value.
 
 Send this header in the WebSocket upgrade request:
 
@@ -140,7 +135,7 @@ Send this header in the WebSocket upgrade request:
 Authorization: Bearer <fresh-signed-jwt>
 ```
 
-Use a backend WebSocket client that supports request headers. Do not put JWTs in URL query parameters. Use WSS for this credential-based integration. Load the supplied CA file for a private-CA endpoint; keep certificate and host validation enabled.
+Use a backend WebSocket client that supports request headers. Do not put JWTs in URL query parameters. Connect to the supplied WS endpoint.
 
 After upgrade, immediately send one UTF-8 JSON text message:
 

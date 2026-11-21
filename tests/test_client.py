@@ -1,19 +1,15 @@
 import asyncio
 import contextlib
-from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path
 import socket
-import ssl
 import tempfile
 import time
 import unittest
 
 from aiohttp import ClientSession, WSMsgType, encode_basic_auth, web
-from cryptography import x509
-from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
-from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 import jwt
 
 from quoteviewer import ClientCredentialsTokenProvider, QuoteFeed, TokenIssuer, create_app, utc_text
@@ -39,17 +35,16 @@ class DirectConnectionTests(unittest.IsolatedAsyncioTestCase):
         self.transport = None
         self.claims = []
         self.token_requests = 0
-        self.server_ssl, self.client_ssl = self.tls_contexts(root, key)
         server = web.Application()
         server.router.add_get("/v1/sources/example-source/quotes/stream", self.stream)
         server.router.add_post("/v1/quote-tokens", self.token)
-        self.bridge, url = await self.listen(server, self.server_ssl)
-        self.config["bridgeUrl"] = url.replace("https:", "wss:")
+        self.bridge, url = await self.listen(server)
+        self.config["bridgeUrl"] = url.replace("http:", "ws:")
         self.issuer = TokenIssuer(self.config, root)
         (root / "client-secret.txt").write_text("synthetic-client-secret")
         self.config["auth"] = {"tokenUrl": url + "/v1/quote-tokens", "clientId": "example-client",
                                "clientSecretFile": "client-secret.txt"}
-        self.feed = QuoteFeed(self.config, ClientCredentialsTokenProvider(self.config, root, self.client_ssl), self.client_ssl)
+        self.feed = QuoteFeed(self.config, ClientCredentialsTokenProvider(self.config, root, True))
         self.viewer, self.viewer_url = await self.listen(create_app(self.feed))
         await self.until(lambda: self.feed.snapshot()["ready"] == 2)
 
@@ -58,46 +53,20 @@ class DirectConnectionTests(unittest.IsolatedAsyncioTestCase):
         await self.bridge.cleanup()
         self.temp.cleanup()
 
-    async def listen(self, app, ssl_context=None):
+    async def listen(self, app):
         runner = web.AppRunner(app, access_log=None)
         await runner.setup()
         listener = socket.socket()
         listener.bind(("localhost", 0))
         listener.listen()
         port = listener.getsockname()[1]
-        await web.SockSite(runner, listener, ssl_context=ssl_context).start()
-        return runner, f"{'https' if ssl_context else 'http'}://localhost:{port}"
-
-    def tls_contexts(self, root, key):
-        now = datetime.now(timezone.utc)
-        ca_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-        ca_name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "Fixture CA")])
-        ca = (x509.CertificateBuilder().subject_name(ca_name).issuer_name(ca_name)
-              .public_key(ca_key.public_key()).serial_number(x509.random_serial_number())
-              .not_valid_before(now - timedelta(minutes=1)).not_valid_after(now + timedelta(days=1))
-              .add_extension(x509.BasicConstraints(ca=True, path_length=0), critical=True)
-              .add_extension(x509.KeyUsage(False, False, False, False, False, True, True, None, None), critical=True)
-              .add_extension(x509.SubjectKeyIdentifier.from_public_key(ca_key.public_key()), critical=False)
-              .sign(ca_key, hashes.SHA256()))
-        leaf = (x509.CertificateBuilder().subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "localhost")]))
-                .issuer_name(ca_name).public_key(key.public_key()).serial_number(x509.random_serial_number())
-                .not_valid_before(now - timedelta(minutes=1)).not_valid_after(now + timedelta(days=1))
-                .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
-                .add_extension(x509.SubjectAlternativeName([x509.DNSName("localhost")]), critical=False)
-                .add_extension(x509.AuthorityKeyIdentifier.from_issuer_public_key(ca_key.public_key()), critical=False)
-                .add_extension(x509.KeyUsage(True, False, True, False, False, False, False, None, None), critical=True)
-                .add_extension(x509.ExtendedKeyUsage([ExtendedKeyUsageOID.SERVER_AUTH]), critical=False)
-                .sign(ca_key, hashes.SHA256()))
-        (root / "ca.pem").write_bytes(ca.public_bytes(serialization.Encoding.PEM))
-        (root / "server.pem").write_bytes(leaf.public_bytes(serialization.Encoding.PEM))
-        server = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-        server.load_cert_chain(root / "server.pem", root / "key.pem")
-        return server, ssl.create_default_context(cafile=str(root / "ca.pem"))
+        await web.SockSite(runner, listener).start()
+        return runner, f"http://localhost:{port}"
 
     async def token(self, request):
         self.assertEqual(request.headers["Authorization"], encode_basic_auth("example-client", "synthetic-client-secret"))
         self.assertEqual(dict(await request.post()), {"grant_type": "client_credentials"})
-        self.assertTrue(request.secure)
+        self.assertFalse(request.secure)
         self.token_requests += 1
         value = await self.issuer()
         return web.json_response({"access_token": value.value, "token_type": "Bearer", "expires_in": 6,

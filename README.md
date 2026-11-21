@@ -2,7 +2,7 @@
 
 A repository containing the market-data API reference and an optional Python diagnostic viewer.
 
-To integrate into an existing backend, use the [Chinese API reference](docs/partner-onboarding.zh-CN.md) or [English API reference](docs/market-data-integration.md). They define the HTTP/WebSocket protocol without depending on this viewer. The operator supplies the API document, assigned connection parameters, client secret and CA certificate privately.
+To integrate into an existing backend, use the [Chinese API reference](docs/partner-onboarding.zh-CN.md) or [English API reference](docs/market-data-integration.md). They define the HTTP/WebSocket protocol without depending on this viewer. The operator supplies the API document, assigned connection parameters and client secret privately.
 
 The remaining instructions are for running the optional diagnostic viewer.
 
@@ -12,13 +12,12 @@ The diagnostic viewer reads these private files:
 
 | File | Purpose |
 | --- | --- |
-| `config.json` | Actual HTTPS/WSS endpoint, source, permitted group and client ID |
+| `config.json` | Actual HTTP/WS endpoint, source, permitted group and client ID |
 | `secrets/client-secret.txt` | Independent client secret, kept on the receiving backend |
-| `certs/bridge-ca.pem` | Server trust certificate when the endpoint uses a private CA |
 
 The credential is bound to one source/group on the server. Changing `config.json` does not grant access to another group. The partner does not generate signing keys or choose `iss`, `aud`, `kid` or `sub`; Bridge fills and signs those fields. No account, trading or funding permission is issued.
 
-This public repository contains placeholders only. A public clone by itself cannot connect to a private deployment. Do not commit the private package, credentials or actual server certificate.
+This public repository contains placeholders only. A public clone by itself cannot connect to a private deployment. Do not commit the private package or credentials.
 
 ## Run
 
@@ -54,16 +53,15 @@ On Windows, use `.venv\Scripts\python.exe`. An external configuration can be sup
 
 | Setting | Meaning |
 | --- | --- |
-| `bridgeUrl` | Direct `wss://` base URL, including the supplied port; no API path |
+| `bridgeUrl` | Direct `ws://` base URL, including the supplied port; no API path |
 | `sourceId` | Exact source assigned by the operator |
 | `group` | Exact MT5 account/pricing group, not an asset category |
 | `httpPort` | Local viewer port; default 8877 |
-| `tlsCaFile` | Trust certificate path, relative to config; `null` uses system trust |
-| `auth.tokenUrl` | Full HTTPS URL of `POST /v1/quote-tokens` |
+| `auth.tokenUrl` | Full HTTP URL of `POST /v1/quote-tokens` |
 | `auth.clientId` | Independent identifier assigned by the operator |
 | `auth.clientSecretFile` | Secret file path, relative to config |
 
-The example config uses a placeholder domain. An IP and port work with a matching IP certificate in the operator's private package. Certificate and host verification remain enabled.
+The example config uses a placeholder host. Use the supplied IP and port for both HTTP token requests and WS quotes; the current deployment uses port `54013` for both.
 
 ## Client behavior and reuse
 
@@ -80,4 +78,4 @@ python -m unittest discover -s tests -p 'test_*.py' -v
 node --test tests/ui.test.mjs
 ```
 
-Node is only needed for the existing UI test. Python tests use verified local HTTPS/WSS, real RSA signatures, credential-based token issuance, two expiry boundaries, rejected renewal and cache recovery. Live deployment acceptance must additionally check the actual network endpoint, fixed group scope and ongoing quotes across token expiry.
+Node is only needed for the existing UI test. Python tests use local HTTP/WS, real RSA signatures, credential-based token issuance, two expiry boundaries, rejected renewal and cache recovery. Live deployment acceptance must additionally check the actual network endpoint, fixed group scope and ongoing quotes across token expiry.
